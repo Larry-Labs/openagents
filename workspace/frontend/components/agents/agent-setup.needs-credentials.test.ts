@@ -6,7 +6,7 @@
  * command line. That command is `agn login <type>` when the device says it has
  * it, else the CLI's own. Read off the real registry entries.
  */
-import { act, createElement } from 'react';
+import React, { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, expect, it, vi } from 'vitest';
 import { messages } from '@/lib/i18n/messages/en-US';
@@ -20,6 +20,13 @@ import opencodeEntry from '../../../backend/registry/opencode.json';
 const t = (key: string, params?: Record<string, string | number>) => translate(messages, messages, 'en-US', key, params);
 vi.mock('@/lib/i18n', () => ({ useT: () => t }));
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+// Native selects, so a test can pick a credential.
+vi.mock('@/components/ui/select', () => ({
+  Select: ({ value, onValueChange, children }: { value: string; onValueChange: (v: string) => void; children: React.ReactNode }) => createElement('select', { value, onChange: (e: React.ChangeEvent<HTMLSelectElement>) => onValueChange(e.target.value) }, children),
+  SelectTrigger: () => null, SelectValue: () => null,
+  SelectContent: ({ children }: { children: React.ReactNode }) => children,
+  SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => createElement('option', { value }, children),
+}));
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let root: Root;
 let host: HTMLDivElement;
@@ -71,8 +78,10 @@ it('offers a key, the desktop app, and agn login on a device that has it', async
 it("falls back to the CLI's own login on a device too old for agn login", async () => {
   await open('codex');
   expect(hint().querySelector('code')!.textContent).toBe('codex login');
-  // A sign-in agent: the form below offers its device sign-in.
-  expect(host.querySelector('[data-testid="agent-setup-signin-hint"]')).not.toBeNull();
+  // A sign-in agent on a device not signed in: the form below asks for the
+  // sign-in or a key, and offers no sign-in that is not there.
+  expect(host.querySelector('[data-testid="agent-setup-creds-required"]')!.textContent)
+    .toContain(t('connect.byokSignInOrKeyRequired', { label: codexEntry.label, device: 'racknerd-363e14e' }));
 });
 
 it('offers only a key for an agent with no sign-in of its own', async () => {
@@ -126,7 +135,13 @@ it('needs no such line where agn login finds the CLI itself', async () => {
   expect(notFound()).toBeNull();
 });
 
-const notSignedIn = () => host.querySelector('[data-testid="agent-setup-not-signed-in"]');
+const credsRequired = () => host.querySelector('[data-testid="agent-setup-creds-required"]');
+const credentialSelect = () => [...host.querySelectorAll('select')].find((sel) => [...sel.options].some((o) => o.value === '__none__'))!;
+const pickSignIn = async () => {
+  const sel = credentialSelect();
+  await act(async () => { sel.value = '__sign_in__'; sel.dispatchEvent(new Event('change', { bubbles: true })); });
+  for (let i = 0; i < 3; i++) await act(async () => {});
+};
 
 const submit = async () => {
   await act(async () => { host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!.click(); });
@@ -135,52 +150,48 @@ const submit = async () => {
 const created = (api: AgentSetupApi) => (api.enqueueNodeCommand as ReturnType<typeof vi.fn>).mock.calls
   .filter((c) => c[1] === 'create_agent');
 
-it('warns, then lets the agent be added anyway when nothing is signed in and no key is picked', async () => {
+it('does not add an agent while nothing is signed in and no key is picked', async () => {
   const api = await open('codex');
   const button = () => host.querySelector<HTMLButtonElement>('[data-testid="agent-setup-submit"]')!;
-  expect(notSignedIn()!.textContent).toContain(t('connect.byokNotSignedInRequired'));
-  expect(notSignedIn()!.getAttribute('role')).toBeNull();
-  expect(button().disabled).toBe(false);
-  expect(button().textContent).toBe(t('connect.agentAddTitle'));
-  // The first click points at the warning instead of adding.
+  expect(credsRequired()!.getAttribute('role')).toBeNull();
+  expect([...credentialSelect().options].map((o) => o.value)).not.toContain('__sign_in__');
+  // No "Add anyway": every click points at the credentials instead.
+  await submit();
   await submit();
   expect(created(api)).toEqual([]);
-  expect(notSignedIn()!.getAttribute('role')).toBe('alert');
-  expect(button().textContent).toBe(t('connect.agentAddAnyway'));
-  // The second adds it, on the device's sign-in to be done later.
-  await submit();
-  expect(created(api)).toHaveLength(1);
+  expect(credsRequired()!.getAttribute('role')).toBe('alert');
+  expect(button().textContent).toBe(t('connect.agentAddTitle'));
 });
 
 it('shows agn login in the sign-in choice and its hint on a device that has it', async () => {
-  await open('codex', { loginCommand: 'agn login codex' });
+  await open('codex', { loginCommand: 'agn login codex', ready: true, signedIn: true });
+  await pickSignIn();
   expect(host.querySelector('[data-testid="agent-setup-signin-hint"]')!.textContent)
     .toContain(t('connect.byokDeviceSignInHint', { label: codexEntry.label, command: 'agn login codex' }));
-  expect(host.textContent).toContain(t('connect.byokDeviceSignIn', { command: 'agn login codex' }));
+  expect(credentialSelect().selectedOptions[0].textContent).toBe(t('connect.byokDeviceSignIn', { command: 'agn login codex' }));
   expect(host.textContent).not.toContain('(codex login)');
 });
 
 it('offers to re-detect, for someone who has just signed in', async () => {
   const api = await open('codex');
-  const redetect = [...notSignedIn()!.querySelectorAll('button')].find((b) => b.textContent === t('connect.nodeReDetect'))!;
+  const redetect = [...credsRequired()!.querySelectorAll('button')].find((b) => b.textContent === t('connect.nodeReDetect'))!;
   await act(async () => { redetect.click(); });
   expect((api.enqueueNodeCommand as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1])).toContain('detect_runtimes');
 });
 
-it('lets an agent through once its device is signed in', async () => {
-  const api = await open('codex', { ready: true });
+it('adds an agent on the device sign-in once the device is signed in', async () => {
+  const api = await open('codex', { ready: true, signedIn: true });
+  expect(credsRequired()!.textContent).toContain(t('connect.byokCredRequired', { label: codexEntry.label }));
+  await pickSignIn();
+  expect(credsRequired()).toBeNull();
   await submit();
   expect(created(api)).toHaveLength(1);
 });
 
-it('lets an agent that installs on add through, since it cannot be signed in yet', async () => {
+it('needs a key for an agent that installs on add, since it cannot be signed in yet', async () => {
   const api = await open('codex', { installed: false });
-  expect(notSignedIn()).toBeNull();
+  expect(credsRequired()!.textContent)
+    .toContain(t('connect.byokInstallKeyRequired', { label: codexEntry.label, device: 'racknerd-363e14e' }));
   await submit();
-  expect(created(api)).toHaveLength(1);
-});
-
-it('does not warn when the device is already signed in', async () => {
-  await open('codex', { ready: true });
-  expect(notSignedIn()).toBeNull();
+  expect(created(api)).toEqual([]);
 });

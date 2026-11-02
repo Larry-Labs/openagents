@@ -33,7 +33,7 @@ const codexDetail = {
   resolve_env: { rules: [{ from: 'LLM_API_KEY', to: 'OPENAI_API_KEY' }, { from: 'LLM_MODEL', to: 'CODEX_MODEL' }] },
 };
 
-async function open({ editAgent, agents = [] }: { editAgent?: NodeAgent; agents?: NodeAgent[] } = {}) {
+async function open({ editAgent, agents = [], runtime = {} }: { editAgent?: NodeAgent; agents?: NodeAgent[]; runtime?: Record<string, unknown> } = {}) {
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
   const api = {
     getAgentCatalogDetail: vi.fn().mockResolvedValue(codexDetail as unknown as AgentCatalogDetail),
@@ -43,7 +43,8 @@ async function open({ editAgent, agents = [] }: { editAgent?: NodeAgent; agents?
   const node = {
     nodeId: 'n1', name: 'LAPTOP', launcherVersion: '0.2.198',
     agents: editAgent ? [editAgent, ...agents] : agents,
-    runtimes: [{ type: 'codex', installed: true, ready: true }],
+    // Signed in to Codex on the device unless a test says otherwise.
+    runtimes: [{ type: 'codex', installed: true, ready: true, signedIn: true, ...runtime }],
   } as unknown as WorkspaceNode;
   await act(async () => root.render(createElement(AgentSetup, {
     node, catalog: [{ name: 'codex', label: 'OpenAI Codex CLI' } as AgentCatalogEntry], api,
@@ -60,15 +61,36 @@ const choose = async (select: HTMLSelectElement, value: string) => {
 };
 const button = (label: string) => [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === label)!;
 
-it('adds a codex agent on the device sign-in and tells the device so', async () => {
+it('adds a codex agent on the device sign-in, once picked, and tells the device so', async () => {
   const api = await open();
   const select = credentialSelect();
+  // Nothing is picked for the user: the sign-in is a choice like a key.
+  expect(select.selectedOptions[0].textContent).toBe(t('connect.byokPickCredential'));
+  await act(async () => button(messages.connect.agentAddTitle).click());
+  expect(api.enqueueNodeCommand).not.toHaveBeenCalled();
+
+  await choose(select, '__sign_in__');
   expect(select.selectedOptions[0].textContent).toBe(t('connect.byokDeviceSignIn', { command: 'codex login' }));
   expect(host.querySelector('[data-testid="agent-setup-signin-hint"]')?.textContent)
     .toContain(t('connect.byokDeviceSignInHint', { label: 'OpenAI Codex CLI', command: 'codex login' }));
 
   await act(async () => button(messages.connect.agentAddTitle).click());
   expect(api.enqueueNodeCommand).toHaveBeenCalledWith('n1', 'create_agent', expect.objectContaining({ type: 'codex', authMode: 'cli_login' }));
+});
+
+it('does not offer the sign-in of a device that is not signed in, a key on it included', async () => {
+  // Ready on a key in <type>.env, which an agent on the sign-in never gets.
+  const api = await open({ runtime: { signedIn: false, auth: { mode: 'api_key', keyMasked: null } } });
+  expect([...credentialSelect().options].map((o) => o.value)).not.toContain('__sign_in__');
+  await act(async () => button(messages.connect.agentAddTitle).click());
+  expect(api.enqueueNodeCommand).not.toHaveBeenCalled();
+  expect(host.querySelector('[data-testid="agent-setup-creds-required"]')!.textContent)
+    .toContain(t('connect.byokSignInOrKeyRequired', { label: 'OpenAI Codex CLI', device: 'LAPTOP' }));
+});
+
+it('offers the sign-in of an older device that reports its type ready on it', async () => {
+  await open({ runtime: { signedIn: undefined, auth: { mode: 'subscription', keyMasked: null } } });
+  expect([...credentialSelect().options].map((o) => o.value)).toContain('__sign_in__');
 });
 
 it('opens an agent on a device-saved key on that key, and a save leaves its model alone', async () => {
@@ -97,7 +119,7 @@ it('switches an agent from its key to the device sign-in only when asked', async
   } as NodeAgent;
   const api = await open({ editAgent: agent });
 
-  await choose(credentialSelect(), '__none__');
+  await choose(credentialSelect(), '__sign_in__');
   expect(host.textContent).toContain(messages.connect.byokSwitchToSignInHint);
   await act(async () => button(messages.connect.nodeSaveChanges).click());
   expect(api.enqueueNodeCommand).toHaveBeenCalledWith('n1', 'configure_agent', expect.objectContaining({ name: 'codex-2', authMode: 'cli_login' }));

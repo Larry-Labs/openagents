@@ -55,7 +55,8 @@ async function open({ type = 'codex', runtime, editAgent, accesses = [] }: { typ
   const node = {
     nodeId: 'n1', name: 'LAPTOP', launcherVersion: '0.2.205',
     agents: editAgent ? [editAgent] : [],
-    runtimes: [{ type, installed: true, ready: true, ...runtime }],
+    // Signed in on the device unless a test says otherwise.
+    runtimes: [{ type, installed: true, ready: true, signedIn: true, ...runtime }],
   } as unknown as WorkspaceNode;
   await act(async () => root.render(createElement(AgentSetup, {
     node, catalog: [{ name: type, label: LABELS[type] } as AgentCatalogEntry], api,
@@ -74,9 +75,12 @@ const choose = async (select: HTMLSelectElement, value: string) => {
   await act(async () => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); });
 };
 const button = (label: string) => [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === label)!;
+// The sign-in is picked like a key; nothing is picked for the user.
+const pickSignIn = async () => { await choose(credentials(), '__sign_in__'); };
 
 it('offers a new codex agent on the device sign-in the models that account can run', async () => {
   const api = await open({ runtime: { cliModels: ACCOUNT_CODEX } });
+  await pickSignIn();
   expect(offered()).toEqual(['gpt-6.1-sol', 'gpt-6-astra']);
   expect(accountHint()?.textContent).toBe(t('connect.nodeModelAccountHint', { label: 'OpenAI Codex CLI' }));
 
@@ -89,6 +93,7 @@ it('offers a new codex agent on the device sign-in the models that account can r
 
 it('keeps the catalog list for a device that does not report its sign-in models', async () => {
   await open({ runtime: {} });
+  await pickSignIn();
   expect(offered()).toEqual(['gpt-5.6-sol', 'gpt-5.6-luna']);
   expect(accountHint()).toBeNull();
 });
@@ -103,7 +108,7 @@ it('drops the sign-in list once a saved key is picked, and brings it back with t
   expect(accountHint()).toBeNull();
   expect(host.textContent).toContain('relay-model');
 
-  await choose(credentials(), '__none__');
+  await pickSignIn();
   expect(offered()).toEqual(['gpt-6.1-sol', 'gpt-6-astra']);
   expect(accountHint()).not.toBeNull();
 });
@@ -114,6 +119,7 @@ it('offers a new claude agent on the device sign-in the models its account can r
     runtime: { cliModels: [{ id: 'opus', label: 'Opus 5.5' }, { id: 'sonnet', label: 'Sonnet 5.5' }] },
   });
   // Claude has the sign-in choice too: its registry entry maps LLM_* and has a login.
+  await pickSignIn();
   expect(credentials().selectedOptions[0].textContent).toBe(t('connect.byokDeviceSignIn', { command: 'claude auth login' }));
   expect(offered()).toEqual(['opus', 'sonnet']);
   expect(accountHint()?.textContent).toBe(t('connect.nodeModelAccountHint', { label: claudeEntry.label }));
