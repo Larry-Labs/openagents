@@ -8,13 +8,19 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Download both Linux architectures
+      - name: Download Linux x64 artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: launcher-linux-*
+          name: launcher-linux-x64
           path: artifacts
-          merge-multiple: true
-          run-id: 41630329180
+          run-id: 41634431688
+          github-token: ${{ github.token }}
+      - name: Download Linux ARM64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: launcher-linux-arm64
+          path: artifacts
+          run-id: 41634431688
           github-token: ${{ github.token }}
       - name: Require both manifests and all four installers
         run: |-
