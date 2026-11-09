@@ -1386,6 +1386,39 @@ def _event_visible_to(event: dict, viewer_email: Optional[str], hidden_channels)
     return not (_is_person_addr(source) or _is_person_addr(target))
 
 
+def _resource_event_visible_to(event: dict, workspace_id: str, viewer) -> bool:
+    """Resource notices need the same read permission as their resource.
+
+    File and knowledge producers can target core (or a public channel) even
+    when the individual resource is private. Channel/DM checks are insufficient.
+    Aggregate notices without a resource id retain their existing semantics.
+    """
+    if viewer.machine:
+        return True
+    etype = str(event.get("type") or "")
+    payload = event.get("payload") or {}
+    if etype.startswith("workspace.file."):
+        kind, resource_id = "file", payload.get("file_id")
+    elif etype.startswith("workspace.knowledge."):
+        kind, resource_id = "knowledge", payload.get("entry_id")
+    else:
+        return True
+    if not resource_id:
+        return True
+    from copy import copy
+    from app.services.access_model import allowed, load_resource
+    # Principal caches groups for a request; an SSE request can live for hours.
+    # Do not keep a revoked group membership alive for the stream's lifetime.
+    principal = copy(viewer)
+    principal._group_ids = None
+    db = SessionLocal()
+    try:
+        resource = load_resource(db, workspace_id, kind, resource_id)
+        return resource is not None and allowed(db, principal, resource, "read", workspace_id)
+    finally:
+        db.close()
+
+
 def _load_hidden_channel_names(workspace_id: str, viewer) -> set:
     db = SessionLocal()
     try:
@@ -1471,7 +1504,8 @@ async def stream_events(
     Visibility matches polling: the viewer is resolved once at connect (a
     bearer — header or `access_token` — wins over the workspace token). For a
     person, private threads they cannot see and DMs they are not a side of are
-    never streamed. Machines / identified agents receive everything.
+    never streamed. File and knowledge notices also require resource read
+    access for people and identified agents; legacy machines remain unfiltered.
     """
     effective_token = x_workspace_token or token
     if not authorization and access_token:
@@ -1512,6 +1546,8 @@ async def stream_events(
                     if not read_state_stream_allows(event, viewer):
                         pass
                     elif stream_filter is not None and not stream_filter.allows(event):
+                        pass
+                    elif not await run_in_threadpool(_resource_event_visible_to, event, workspace_id, viewer):
                         pass
                     elif not (target_prefix and event.get("target", "") != target_prefix):
                         event_id = event.get("id", "")
