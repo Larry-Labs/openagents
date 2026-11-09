@@ -199,3 +199,104 @@ def test_resource_stream_does_not_cache_revoked_group_membership(client, db, wor
     result = client.get(f"/v1/events/stream?network={workspace['id']}", headers={"Authorization": "Bearer vic"})
     assert result.status_code == 200
     assert sum(line.startswith("data: ") for line in result.text.splitlines()) == 1
+
+
+@pytest.mark.parametrize('change', ['transfer', 'removed', 'missing', 'ownerless'])
+def test_open_agent_stream_refreshes_current_membership(
+    client, db, workspace, people, monkeypatch, change,
+):
+    from app.models import KnowledgeEntry, WorkspaceMember
+    member = db.get(WorkspaceMember, (workspace['id'], 'agent-alpha'))
+    member.owner_email = 'mia@acme.test'
+    # Losing ownership must not upgrade an established agent stream to machine.
+    from app.models import Workspace
+    db.get(Workspace, workspace['id']).legacy_machine_access = True
+    old = KnowledgeEntry(workspace_id=workspace['id'], slug='old-owner', title='Old owner private',
+                         created_by='human:mia@acme.test', owner='human:mia@acme.test', visibility='private')
+    new = KnowledgeEntry(workspace_id=workspace['id'], slug='new-owner', title='New owner private',
+                         created_by='human:vic@acme.test', owner='human:vic@acme.test', visibility='private')
+    public = KnowledgeEntry(workspace_id=workspace['id'], slug='public-resource', title='Public',
+                            created_by='human:mia@acme.test', visibility='public')
+    db.add_all([old, new, public])
+    db.commit()
+
+    def wire(event_id, resource):
+        return json.dumps({'id': event_id, 'type': 'workspace.knowledge.updated', 'target': 'core',
+                           'visibility': 'channel', 'payload': {'entry_id': resource.id}}).encode()
+
+    async def subscribe(channel):
+        yield wire('before', old)
+        if change == 'transfer':
+            member.owner_email = 'vic@acme.test'
+        elif change == 'removed':
+            member.status = 'removed'
+        elif change == 'missing':
+            db.delete(member)
+        else:
+            member.owner_email = None
+        db.commit()
+        yield wire('old-after', old)
+        yield wire('new-after', new)
+        yield wire('public-after', public)
+
+    monkeypatch.setattr(cache, 'subscribe_events', subscribe)
+    response = client.get(f"/v1/events/stream?network={workspace['id']}", headers={
+        'X-Workspace-Token': workspace['token'], 'X-Agent-Name': 'agent-alpha',
+    })
+    assert response.status_code == 200
+    ids = [json.loads(line[6:])['id'] for line in response.text.splitlines() if line.startswith('data: ')]
+    expected = ['before']
+    if change == 'transfer':
+        expected += ['new-after', 'public-after']
+    elif change == 'ownerless':
+        expected += ['public-after']
+    assert ids == expected
+
+
+def test_open_human_stream_refreshes_role_derived_groups(client, db, workspace, people, monkeypatch):
+    from sqlalchemy import select
+    from app.models import KnowledgeEntry, User, WorkspaceMembership
+    from app.services.access_model import create_grant, get_or_create_builtin_groups
+    user = db.scalar(select(User).where(User.email == 'vic@acme.test'))
+    membership = db.get(WorkspaceMembership, (workspace['id'], user.id))
+    membership.role = 'guest'
+    entry = KnowledgeEntry(workspace_id=workspace['id'], slug='guest-only', title='Guest grant',
+                           created_by='human:mia@acme.test', visibility='private')
+    db.add(entry)
+    db.flush()
+    guest = get_or_create_builtin_groups(db, workspace['id'])['guest']
+    create_grant(db, workspace['id'], resource_kind='knowledge', resource_id=entry.id,
+                 grantee_kind='group', grantee_id=guest.id, rights=['read'])
+    db.commit()
+    wire = json.dumps({'type': 'workspace.knowledge.updated', 'target': 'core', 'visibility': 'channel',
+                       'payload': {'entry_id': entry.id}}).encode()
+
+    async def subscribe(channel):
+        yield wire
+        membership.role = 'member'
+        db.commit()
+        yield wire
+
+    monkeypatch.setattr(cache, 'subscribe_events', subscribe)
+    response = client.get(f"/v1/events/stream?network={workspace['id']}", headers={'Authorization': 'Bearer vic'})
+    assert response.status_code == 200
+    assert sum(line.startswith('data: ') for line in response.text.splitlines()) == 1
+
+
+def test_explicit_legacy_machine_stream_remains_unfiltered(client, db, workspace, monkeypatch):
+    from app.models import Workspace, WorkspaceMember
+    db.get(Workspace, workspace['id']).legacy_machine_access = True
+    db.get(WorkspaceMember, (workspace['id'], 'agent-alpha')).owner_email = None
+    db.commit()
+    wire = json.dumps({'id': 'legacy', 'type': 'workspace.knowledge.deleted', 'target': 'core',
+                       'payload': {'entry_id': 'synthetic-missing-resource'}}).encode()
+
+    async def subscribe(channel):
+        yield wire
+
+    monkeypatch.setattr(cache, 'subscribe_events', subscribe)
+    response = client.get(f"/v1/events/stream?network={workspace['id']}", headers={
+        'X-Workspace-Token': workspace['token'], 'X-Agent-Name': 'agent-alpha',
+    })
+    assert response.status_code == 200
+    assert sum(line.startswith('data: ') for line in response.text.splitlines()) == 1

@@ -1405,14 +1405,27 @@ def _resource_event_visible_to(event: dict, workspace_id: str, viewer) -> bool:
         return True
     if not resource_id:
         return True
-    from copy import copy
-    from app.services.access_model import allowed, load_resource
-    # Principal caches groups for a request; an SSE request can live for hours.
-    # Do not keep a revoked group membership alive for the stream's lifetime.
-    principal = copy(viewer)
-    principal._group_ids = None
+    from app.models import WorkspaceMember
+    from app.services.access_model import Principal, allowed, load_resource, role_for_email
     db = SessionLocal()
     try:
+        # A stream outlives ownership/role changes. Rebuild from authoritative
+        # rows, with no request-scoped group cache or former owner inheritance.
+        if viewer.kind == "agent":
+            member = db.get(WorkspaceMember, (workspace_id, viewer.agent_name))
+            if member is None or member.status == "removed":
+                return False
+            # Keep an established agent identity restricted even if it loses
+            # its owner; never fall back to resolve_principal's legacy machine.
+            principal = Principal("agent", agent_name=member.agent_name,
+                                  owner_email=member.owner_email, workspace_id=workspace_id)
+        else:
+            workspace = db.get(Workspace, workspace_id)
+            if workspace is None:
+                return False
+            principal = Principal("human", email=viewer.email,
+                                  role=role_for_email(db, workspace, viewer.email),
+                                  workspace_id=workspace_id)
         resource = load_resource(db, workspace_id, kind, resource_id)
         return resource is not None and allowed(db, principal, resource, "read", workspace_id)
     finally:
